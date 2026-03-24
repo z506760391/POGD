@@ -3,7 +3,7 @@
 本项目遵循 TRIPOD+AI 指南，提供了一个用于预测术后胃功能障碍 (POGD) 的机器学习模型、完整的可复现分析代码以及一个交互式的在线风险计算器。
 
 ## 项目结构
-. ├── output/ # 存放所有分析结果 (图表, CSV, 模型文件) ├── calculator_app.py # 在线风险计算器的Streamlit应用代码 ├── ml_pogd_final_v5_1 - 副本.py # 主分析脚本 ├── requirements.txt # Python依赖环境 └── README.md # 本说明文件
+. ├── output/ # 存放所有分析结果 (图表, CSV, 模型文件) ├── calculator_app.py # 在线风险计算器的Streamlit应用代码 ├── ml_pogd_final_v5_1.py # 主分析脚本 ├── requirements.txt # Python依赖环境 └── README.md # 本说明文件
 
 ## 如何使用
 
