@@ -25,7 +25,7 @@ pip install -r requirements.txt
 此脚本将执行完整的数据预处理、模型训练、评估和可视化流程。最重要的是，它会在 `output/` 文件夹中生成部署在线计算器所需的模型文件 (`ensemble_model_components.pkl`)。
 
 ```bash
-python "ml_pogd_final_v5_1 - 副本.py"
+python "ml_pogd_final_v5_1.py"
 ```
 
 运行成功后，您将在 `output/` 目录下看到所有的性能指标、SHAP分析图以及保存好的模型文件。
@@ -54,7 +54,7 @@ streamlit run calculator_app.py
 ## TRIPOD+AI 合规性清单
 
 -   [x] **模型的完整预测公式**: 通过提供训练好的模型文件 (`.pkl`) 和加载/预测代码 (`calculator_app.py`) 来实现。
--   [x] **可运行的分析代码**: `ml_pogd_final_v5_1 - 副本.py` 提供了完整的分析流程。
+-   [x] **可运行的分析代码**: `ml_pogd_final_v5_1.py` 提供了完整的分析流程。
 -   [x] **在线计算器**: `calculator_app.py` 提供了一个交互式的风险计算器实现。
 -   [x] **依赖与环境**: `requirements.txt` 确保了环境的可复现性。
 
