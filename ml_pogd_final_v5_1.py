@@ -38,7 +38,7 @@ from scipy import stats
 from scipy.stats import chi2_contingency, ks_2samp
 from sklearn.utils import resample
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_score
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, cohen_kappa_score, brier_score_loss, average_precision_score,
@@ -106,6 +106,8 @@ MIN_FEATURES       = 5
 MAX_FEAT_RATIO     = 5
 PVAL_THRESHOLD     = 0.3   # Single-variable screening threshold (P < 0.3); ensure this matches your manuscript's reported value
 KS_DRIFT_THRESHOLD = 0.35
+INTERNAL_KS_SPLIT  = 0.2   # Fraction of training set used as internal check set for KS drift detection
+NESTED_OUTER_FOLDS = 5     # Outer folds for nested cross-validation (supplementary material)
 
 np.random.seed(RANDOM_SEED)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -482,27 +484,41 @@ print("\n" + "=" * 120)
 print("【第1部分】单变量特征筛选（仅用训练集，符合TRIPOD要求）")
 print("=" * 120)
 
-# KS drift detection is run for REPORTING and visualization only.
-# Its results must NOT be used to filter features for model training, because
-# the external validation set would then influence the training pipeline,
-# constituting information leakage that invalidates generalisation estimates.
-drift_info_feats = []   # informational only — not used to remove features
+# --- Internal stability KS check (training-set 8:2 sub-split, no external data involved) ---
+# The training set is split 8:2; KS tests run between the two sub-sets to identify
+# features whose distributions are inconsistent within the training data itself.
+# These unstable features are excluded from the modelling pipeline.
+_step(f"正在对训练集做 {int((1-INTERNAL_KS_SPLIT)*100)}:{int(INTERNAL_KS_SPLIT*100)} 内部子集拆分，用于 KS 漂移检测（不使用外部集数据）...")
+Xtr_ks_train, Xtr_ks_check, _, _ = train_test_split(
+    Xtr, ytr, test_size=INTERNAL_KS_SPLIT, random_state=RANDOM_SEED + 1, stratify=ytr)
+_step("正在进行训练集内部 KS 检验，识别高漂移特征...")
+_, drift_remove_feats = distribution_shift_report(Xtr_ks_train, Xtr_ks_check, feat_cols,
+                                                   ks_threshold=KS_DRIFT_THRESHOLD)
+if drift_remove_feats:
+    print(f"  ⚠️  将剔除内部高漂移特征（KS>{KS_DRIFT_THRESHOLD}）: {drift_remove_feats}")
+else:
+    print("  ✅ 训练集内部无高漂移特征，全部保留")
+
+# --- External KS check: baseline comparability reporting only, NOT used for feature removal ---
+external_drift_feats = []   # informational only — not used to remove features
 if has_ext:
-    _step("P5修复：正在进行KS检验特征分布漂移分析（仅用于报告，不参与特征筛选，避免外部集信息泄露）...")
-    _, drift_info_feats = distribution_shift_report(Xtr, Xe, feat_cols)
-    if drift_info_feats:
-        print(f"  ℹ️  检测到高漂移特征（KS>{KS_DRIFT_THRESHOLD}，仅供参考）: {drift_info_feats}")
-        print(f"  ℹ️  高漂移特征将保留在训练流程中；仅在方法学部分披露，不剔除。")
+    _step("正在进行外部集 KS 漂移报告（仅用于基线可比性报告，不参与特征筛选，避免外部集信息泄露）...")
+    _, external_drift_feats = distribution_shift_report(Xtr, Xe, feat_cols)
+    if external_drift_feats:
+        print(f"  ℹ️  外部集高漂移特征（KS>{KS_DRIFT_THRESHOLD}，仅供参考）: {external_drift_feats}")
+        print(f"  ℹ️  外部集漂移特征不参与特征剔除决策。")
     else:
-        print("  ✅ 未发现高漂移特征")
+        print("  ✅ 外部集与训练集特征分布无高漂移")
 
 # Feature count cap is based solely on EPV from the training set (no external data).
-max_ft = max(MIN_FEATURES, min(recommended_max, len(feat_cols)))
+max_ft = max(MIN_FEATURES, min(recommended_max, len(feat_cols) - len(drift_remove_feats)))
 print(f"\n  阳性样本数={n_pos}，最多保留{max_ft}个特征（最少{MIN_FEATURES}个）")
 
 _step("正在进行单变量统计检验（Mann-Whitney U / 卡方检验）...")
 uni = []
 for c in feat_cols:
+    if c in drift_remove_feats:
+        continue
     try:
         if c in cat_c or Xtr[c].nunique() <= 5:
             ct = pd.crosstab(Xtr[c], ytr)
@@ -660,8 +676,58 @@ for bi, (Xb, yb) in enumerate(bags):
 print("  ✅ All subset training complete!")
 
 # ============================================================
-# 【第5部分】预测与评估
+# 【第4B部分】嵌套交叉验证（补充材料：验证模型泛化稳定性）
 # ============================================================
+print("\n" + "=" * 120)
+print(f"【第4B部分】嵌套交叉验证（补充材料，{NESTED_OUTER_FOLDS}折外层×{CV_FOLDS}折内层）")
+print("=" * 120)
+print("  说明：此部分对全内部数据集（训练+内部验证合并）运行嵌套CV，")
+print("        外层折评估泛化性能，内层GridSearchCV优化超参数，结果作为补充材料。")
+
+_step("正在准备全内部数据集（重新应用预处理）...")
+Xi_imp = Xi.copy()
+for c in feat_cols:
+    Xi_imp[c] = pd.to_numeric(Xi_imp[c], errors='coerce').fillna(fv[c])
+for c in cat_c:
+    Xi_imp[c] = sle(Xi_imp[c], les[c])
+Xi_sel_full = pd.DataFrame(
+    sc_std.transform(Xi_imp[feat_cols]), columns=feat_cols, index=Xi_imp.index
+)[sel_ft]
+yi_arr = _np(yi)
+
+outer_cv  = StratifiedKFold(n_splits=NESTED_OUTER_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+inner_cv  = StratifiedKFold(n_splits=CV_FOLDS,           shuffle=True, random_state=RANDOM_SEED)
+nested_rows = []
+
+_step(f"正在对 {len(clf_names)} 个基分类器运行嵌套CV（外层{NESTED_OUTER_FOLDS}折，内层{CV_FOLDS}折GridSearchCV）...")
+for idx_m, (nm, cfg) in enumerate(clf_cfg.items()):
+    print(f"    [{idx_m+1}/{len(clf_cfg)}] 嵌套CV for {nm}...", end=' ', flush=True)
+    try:
+        gs_inner = GridSearchCV(clone(cfg['model']), cfg['params'], cv=inner_cv,
+                                scoring='average_precision', n_jobs=-1, error_score=0.)
+        ap_sc  = cross_val_score(gs_inner, Xi_sel_full, yi_arr, cv=outer_cv,
+                                 scoring='average_precision', n_jobs=-1)
+        roc_sc = cross_val_score(gs_inner, Xi_sel_full, yi_arr, cv=outer_cv,
+                                 scoring='roc_auc', n_jobs=-1)
+        nested_rows.append({
+            '模型':               nm,
+            '嵌套CV AUC-PR 均值':  round(ap_sc.mean(),  4),
+            '嵌套CV AUC-PR 标准差': round(ap_sc.std(),   4),
+            '嵌套CV AUC-ROC 均值': round(roc_sc.mean(), 4),
+            '嵌套CV AUC-ROC 标准差':round(roc_sc.std(),  4),
+        })
+        print(f"AUC-PR={ap_sc.mean():.4f}±{ap_sc.std():.4f}  "
+              f"AUC-ROC={roc_sc.mean():.4f}±{roc_sc.std():.4f}  ✅")
+    except Exception as e:
+        print(f"失败: {str(e)[:70]}  ⚠️")
+
+if nested_rows:
+    nested_cv_df = pd.DataFrame(nested_rows).sort_values('嵌套CV AUC-PR 均值', ascending=False)
+    nested_cv_df.to_csv(out('nested_cv_results.csv'), index=False, encoding='utf-8-sig')
+    print(f"\n  嵌套CV汇总：\n{nested_cv_df.to_string(index=False)}")
+    print(f"  ✅ 嵌套CV结果已保存: {out('nested_cv_results.csv')}")
+
+
 print("\n" + "=" * 120)
 print("【第5部分】各基分类器预测与评估")
 print("=" * 120)
