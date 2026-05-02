@@ -38,7 +38,7 @@ from scipy import stats
 from scipy.stats import chi2_contingency, ks_2samp
 from sklearn.utils import resample
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_score
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, cohen_kappa_score, brier_score_loss, average_precision_score,
@@ -97,15 +97,17 @@ SHAP_SAMPLE        = 150
 SHAP_BG            = 50
 BOOTSTRAP_N        = 1000
 CI_LEVEL           = 0.95
-DATA_PATH          = 'D:/pycharm/pythonProject1/output/20260411.csv'
+DATA_PATH          = 'data.csv'   # Use a relative path; place your CSV file in the same directory as this script
 OUTPUT_DIR         = 'output'
 TARGET_COL         = 'POGD'
 INS_CANDIDATES     = ['ins', 'INS', 'source', '来源']
 ID_CANDIDATES      = ['ID', 'id', '样本ID', '样本id']
 MIN_FEATURES       = 5
 MAX_FEAT_RATIO     = 5
-PVAL_THRESHOLD     = 0.3
+PVAL_THRESHOLD     = 0.3   # Single-variable screening threshold (P < 0.3); ensure this matches your manuscript's reported value
 KS_DRIFT_THRESHOLD = 0.35
+INTERNAL_KS_SPLIT  = 0.2   # Fraction of training set used as internal check set for KS drift detection
+NESTED_OUTER_FOLDS = 5     # Outer folds for nested cross-validation (supplementary material)
 
 np.random.seed(RANDOM_SEED)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -198,6 +200,43 @@ def bci(yt, yp, func, nb=BOOTSTRAP_N, ci=CI_LEVEL, seed=RANDOM_SEED):
     if not sc: return float('nan'), float('nan')
     a = (1 - ci) / 2
     return float(np.quantile(sc, a)), float(np.quantile(sc, 1 - a))
+
+def delong_test(y_true, y_pred1, y_pred2):
+    """
+    DeLong test for comparing two correlated AUCs (DeLong et al., 1988).
+    Returns (z_statistic, p_value).
+    """
+    y_true = _np(y_true); y1 = _np(y_pred1); y2 = _np(y_pred2)
+    pos_idx = np.where(y_true == 1)[0]
+    neg_idx = np.where(y_true == 0)[0]
+    n1, n2 = len(pos_idx), len(neg_idx)
+    if n1 == 0 or n2 == 0:
+        return float('nan'), float('nan')
+
+    def _placement(scores):
+        V10 = np.array([
+            np.mean((scores[pos_idx[i]] > scores[neg_idx]) +
+                    0.5 * (scores[pos_idx[i]] == scores[neg_idx]))
+            for i in range(n1)])
+        V01 = np.array([
+            np.mean((scores[pos_idx] > scores[neg_idx[j]]) +
+                    0.5 * (scores[pos_idx] == scores[neg_idx[j]]))
+            for j in range(n2)])
+        return V10, V01
+
+    V10_1, V01_1 = _placement(y1)
+    V10_2, V01_2 = _placement(y2)
+    auc1, auc2 = np.mean(V10_1), np.mean(V10_2)
+    # Covariance of [auc1, auc2] via structural components
+    mat10 = np.cov(np.vstack([V10_1, V10_2])) / n1
+    mat01 = np.cov(np.vstack([V01_1, V01_2])) / n2
+    S = mat10 + mat01
+    var_diff = S[0, 0] + S[1, 1] - 2 * S[0, 1]
+    if var_diff <= 1e-12:
+        return float('nan'), float('nan')
+    z = (auc1 - auc2) / np.sqrt(var_diff)
+    p = float(2 * (1 - stats.norm.cdf(abs(z))))
+    return float(z), p
 
 def roc_ci(yt, yp, nb=BOOTSTRAP_N, ci=CI_LEVEL, seed=RANDOM_SEED):
     yt = _np(yt); yp = _np(yp)
@@ -447,6 +486,9 @@ for c in cat_c:
 print(f"  ✅ 编码分类变量: {cat_c if cat_c else '无'}")
 
 _step("正在用训练集统计量填充缺失值（防止验证集泄露）...")
+# Missing values are imputed with per-feature median (numeric) or mode (categorical)
+# computed exclusively on the training set.  If KNN imputation is desired instead,
+# replace the block below with sklearn.impute.KNNImputer fitted on Xtr only.
 fv = {}
 for c in feat_cols:
     fv[c] = Xtr[c].median() if Xtr[c].dtype in ['float64', 'int64'] \
@@ -479,15 +521,33 @@ print("\n" + "=" * 120)
 print("【第1部分】单变量特征筛选（仅用训练集，符合TRIPOD要求）")
 print("=" * 120)
 
-drift_remove_feats = []
-if has_ext:
-    _step("P5修复：正在进行KS检验特征分布漂移分析...")
-    _, drift_remove_feats = distribution_shift_report(Xtr, Xe, feat_cols)
-    if drift_remove_feats:
-        print(f"  ⚠️  将剔除高漂移特征（KS>{KS_DRIFT_THRESHOLD}）: {drift_remove_feats}")
-    else:
-        print("  ✅ 未发现高漂移特征")
+# --- Internal stability KS check (training-set 8:2 sub-split, no external data involved) ---
+# The training set is split 8:2; KS tests run between the two sub-sets to identify
+# features whose distributions are inconsistent within the training data itself.
+# These unstable features are excluded from the modelling pipeline.
+_step(f"正在对训练集做 {int((1-INTERNAL_KS_SPLIT)*100)}:{int(INTERNAL_KS_SPLIT*100)} 内部子集拆分，用于 KS 漂移检测（不使用外部集数据）...")
+Xtr_ks_train, Xtr_ks_check, _, _ = train_test_split(
+    Xtr, ytr, test_size=INTERNAL_KS_SPLIT, random_state=RANDOM_SEED + 1, stratify=ytr)
+_step("正在进行训练集内部 KS 检验，识别高漂移特征...")
+_, drift_remove_feats = distribution_shift_report(Xtr_ks_train, Xtr_ks_check, feat_cols,
+                                                   ks_threshold=KS_DRIFT_THRESHOLD)
+if drift_remove_feats:
+    print(f"  ⚠️  将剔除内部高漂移特征（KS>{KS_DRIFT_THRESHOLD}）: {drift_remove_feats}")
+else:
+    print("  ✅ 训练集内部无高漂移特征，全部保留")
 
+# --- External KS check: baseline comparability reporting only, NOT used for feature removal ---
+external_drift_feats = []   # informational only — not used to remove features
+if has_ext:
+    _step("正在进行外部集 KS 漂移报告（仅用于基线可比性报告，不参与特征筛选，避免外部集信息泄露）...")
+    _, external_drift_feats = distribution_shift_report(Xtr, Xe, feat_cols)
+    if external_drift_feats:
+        print(f"  ℹ️  外部集高漂移特征（KS>{KS_DRIFT_THRESHOLD}，仅供参考）: {external_drift_feats}")
+        print(f"  ℹ️  外部集漂移特征不参与特征剔除决策。")
+    else:
+        print("  ✅ 外部集与训练集特征分布无高漂移")
+
+# Feature count cap is based solely on EPV from the training set (no external data).
 max_ft = max(MIN_FEATURES, min(recommended_max, len(feat_cols) - len(drift_remove_feats)))
 print(f"\n  阳性样本数={n_pos}，最多保留{max_ft}个特征（最少{MIN_FEATURES}个）")
 
@@ -621,6 +681,14 @@ for idx_m, (nm, cfg) in enumerate(clf_cfg.items()):
         print(f"Failed: {str(e)[:50]}  ⚠️")
 
 _step(f"[4.2] Starting EasyEnsemble training ({EASY_N_BAGS} subsets × {len(clf_names)} classifiers = {EASY_N_BAGS*len(clf_names)} sub-models)...")
+# NOTE — double-calibration pipeline:
+#   Stage 1 (here): each base model in every EasyEnsemble bag is wrapped with
+#            CalibratedClassifierCV(method='sigmoid', cv=3), fitted on the
+#            balanced bag data only — no leakage from validation/external sets.
+#   Stage 2 (Part 6): the soft-voting ensemble raw probabilities are calibrated
+#            once more with Platt scaling, fitted exclusively on the full
+#            training set — still no leakage.
+# Both stages are independent of the validation and external sets.
 print("      P7 Fix: Use CalibratedClassifierCV(sigmoid, cv=3) for each subset to mitigate overfitting")
 bag_mods = []
 for bi, (Xb, yb) in enumerate(bags):
@@ -645,8 +713,101 @@ for bi, (Xb, yb) in enumerate(bags):
 print("  ✅ All subset training complete!")
 
 # ============================================================
-# 【第5部分】预测与评估
+# 【第4B部分】嵌套交叉验证（补充材料：验证模型泛化稳定性）
 # ============================================================
+print("\n" + "=" * 120)
+print(f"【第4B部分】嵌套交叉验证（补充材料，{NESTED_OUTER_FOLDS}折外层×{CV_FOLDS}折内层）")
+print("=" * 120)
+print("  说明：此部分对全内部数据集（训练+内部验证合并）运行嵌套CV，")
+print("        外层折评估泛化性能，内层GridSearchCV优化超参数，结果作为补充材料。")
+
+_step("正在准备全内部数据集（重新应用预处理）...")
+Xi_imp = Xi.copy()
+for c in feat_cols:
+    Xi_imp[c] = pd.to_numeric(Xi_imp[c], errors='coerce').fillna(fv[c])
+for c in cat_c:
+    Xi_imp[c] = sle(Xi_imp[c], les[c])
+Xi_sel_full = pd.DataFrame(
+    sc_std.transform(Xi_imp[feat_cols]), columns=feat_cols, index=Xi_imp.index
+)[sel_ft]
+yi_arr = _np(yi)
+
+outer_cv  = StratifiedKFold(n_splits=NESTED_OUTER_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+inner_cv  = StratifiedKFold(n_splits=CV_FOLDS,           shuffle=True, random_state=RANDOM_SEED)
+nested_rows = []
+
+_step(f"正在对 {len(clf_names)} 个基分类器运行嵌套CV（外层{NESTED_OUTER_FOLDS}折，内层{CV_FOLDS}折GridSearchCV）...")
+for idx_m, (nm, cfg) in enumerate(clf_cfg.items()):
+    print(f"    [{idx_m+1}/{len(clf_cfg)}] 嵌套CV for {nm}...", end=' ', flush=True)
+    try:
+        gs_inner = GridSearchCV(clone(cfg['model']), cfg['params'], cv=inner_cv,
+                                scoring='average_precision', n_jobs=-1, error_score=0.)
+        ap_sc  = cross_val_score(gs_inner, Xi_sel_full, yi_arr, cv=outer_cv,
+                                 scoring='average_precision', n_jobs=-1)
+        roc_sc = cross_val_score(gs_inner, Xi_sel_full, yi_arr, cv=outer_cv,
+                                 scoring='roc_auc', n_jobs=-1)
+        nested_rows.append({
+            '模型':               nm,
+            '嵌套CV AUC-PR 均值':  round(ap_sc.mean(),  4),
+            '嵌套CV AUC-PR 标准差': round(ap_sc.std(),   4),
+            '嵌套CV AUC-ROC 均值': round(roc_sc.mean(), 4),
+            '嵌套CV AUC-ROC 标准差':round(roc_sc.std(),  4),
+        })
+        print(f"AUC-PR={ap_sc.mean():.4f}±{ap_sc.std():.4f}  "
+              f"AUC-ROC={roc_sc.mean():.4f}±{roc_sc.std():.4f}  ✅")
+    except Exception as e:
+        print(f"失败: {str(e)[:70]}  ⚠️")
+
+if nested_rows:
+    nested_cv_df = pd.DataFrame(nested_rows).sort_values('嵌套CV AUC-PR 均值', ascending=False)
+    nested_cv_df.to_csv(out('nested_cv_results.csv'), index=False, encoding='utf-8-sig')
+    print(f"\n  嵌套CV汇总：\n{nested_cv_df.to_string(index=False)}")
+    print(f"  ✅ 嵌套CV结果已保存: {out('nested_cv_results.csv')}")
+
+# --- SMOTE sensitivity analysis (supplement: compare to EasyEnsemble) ---
+_step("正在进行类不平衡方法敏感性分析（SMOTE vs EasyEnsemble）...")
+try:
+    from imblearn.over_sampling import SMOTE
+    smote_rows = []
+    smote_cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    for nm_s, cfg_s in clf_cfg.items():
+        try:
+            smote_ap_list = []
+            smote_roc_list = []
+            for tr_idx, va_idx in smote_cv.split(Xi_sel_full, yi_arr):
+                X_fold_tr, y_fold_tr = Xi_sel_full.iloc[tr_idx], yi_arr[tr_idx]
+                X_fold_va, y_fold_va = Xi_sel_full.iloc[va_idx], yi_arr[va_idx]
+                sm = SMOTE(random_state=RANDOM_SEED)
+                X_res, y_res = sm.fit_resample(X_fold_tr, y_fold_tr)
+                m_s = clone(cfg_s['model'])
+                if nm_s in bp and bp[nm_s]: m_s.set_params(**bp[nm_s])
+                m_s.fit(X_res, y_res)
+                yp_fold = m_s.predict_proba(X_fold_va)[:, 1]
+                if len(np.unique(y_fold_va)) > 1:
+                    smote_ap_list.append(average_precision_score(y_fold_va, yp_fold))
+                    smote_roc_list.append(roc_auc_score(y_fold_va, yp_fold))
+            if smote_ap_list:
+                smote_rows.append({
+                    '模型':                nm_s,
+                    'SMOTE CV AUC-PR 均值': round(np.mean(smote_ap_list),  4),
+                    'SMOTE CV AUC-PR 标准差':round(np.std(smote_ap_list),   4),
+                    'SMOTE CV AUC-ROC 均值':round(np.mean(smote_roc_list), 4),
+                    'SMOTE CV AUC-ROC 标准差':round(np.std(smote_roc_list), 4),
+                    'EasyEnsemble CV AUC-PR': round(cv_scores.get(nm_s, float('nan')), 4),
+                })
+        except Exception as e_s:
+            print(f"    {nm_s} SMOTE失败: {str(e_s)[:60]}  ⚠️")
+    if smote_rows:
+        smote_df = pd.DataFrame(smote_rows).sort_values('SMOTE CV AUC-PR 均值', ascending=False)
+        smote_df.to_csv(out('smote_vs_easyensemble.csv'), index=False, encoding='utf-8-sig')
+        print(f"\n  SMOTE vs EasyEnsemble 对比汇总：\n{smote_df.to_string(index=False)}")
+        print(f"  ✅ 对比结果已保存: {out('smote_vs_easyensemble.csv')}")
+except ImportError:
+    print("  ⚠️ imbalanced-learn 未安装，跳过SMOTE敏感性分析（pip install imbalanced-learn）")
+except Exception as e_smote:
+    print(f"  ⚠️ SMOTE敏感性分析失败: {str(e_smote)[:80]}")
+
+
 print("\n" + "=" * 120)
 print("【第5部分】各基分类器预测与评估")
 print("=" * 120)
@@ -727,6 +888,65 @@ if has_ext:
 DS_KEYS   = ['tr', 'va'] + (['ex'] if has_ext else [])
 DS_LABELS = ['训练集', '内部验证集'] + (['外部验证集'] if has_ext else [])
 nc = len(DS_KEYS)
+
+# ============================================================
+# 【第6B部分】集成策略敏感性分析 + DeLong检验（补充材料）
+# ============================================================
+print("\n" + "=" * 120)
+print("【第6B部分】集成策略敏感性分析（Top N × 加权/等权重）+ DeLong检验（补充材料）")
+print("=" * 120)
+
+_step("测试不同 Top-N 及加权/等权重集成策略（内部验证集）...")
+sens_rows = []
+for n_top in [2, 3, 5]:
+    n_top = min(n_top, len(clf_names))
+    top_n = [nm for nm, _ in sorted(cv_scores.items(),
+                                    key=lambda x: x[1] if not np.isnan(x[1]) else -1,
+                                    reverse=True)[:n_top]]
+    try:
+        prob_w = wsv(bag_mods, Xva_sel, top_n, cv_scores)
+        prob_e = wsv(bag_mods, Xva_sel, top_n, {nm: 1. for nm in top_n})
+        auc_w  = roc_auc_score(yn['va'], prob_w)
+        auc_e  = roc_auc_score(yn['va'], prob_e)
+        ap_w   = average_precision_score(yn['va'], prob_w)
+        ap_e   = average_precision_score(yn['va'], prob_e)
+        sens_rows.append({'Top-N': f'Top{n_top}', '策略': '加权投票',   'AUC-ROC': round(auc_w, 4), 'AUC-PR': round(ap_w, 4), '模型列表': str(top_n)})
+        sens_rows.append({'Top-N': f'Top{n_top}', '策略': '等权重投票', 'AUC-ROC': round(auc_e, 4), 'AUC-PR': round(ap_e, 4), '模型列表': str(top_n)})
+        print(f"  Top{n_top} 加权   AUC-ROC={auc_w:.4f}  AUC-PR={ap_w:.4f}")
+        print(f"  Top{n_top} 等权重 AUC-ROC={auc_e:.4f}  AUC-PR={ap_e:.4f}")
+    except Exception as e_sens:
+        print(f"  Top{n_top} 失败: {str(e_sens)[:60]}  ⚠️")
+
+if sens_rows:
+    sens_df = pd.DataFrame(sens_rows)
+    sens_df.to_csv(out('ensemble_sensitivity.csv'), index=False, encoding='utf-8-sig')
+    print(f"  ✅ 集成敏感性分析已保存: {out('ensemble_sensitivity.csv')}")
+
+_step("DeLong检验：集成模型 vs 最佳单模型（内部验证集）...")
+try:
+    ep_va      = ep['va']
+    best_va    = prob['va'][best_s]
+    z_dl, p_dl = delong_test(yn['va'], ep_va, best_va)
+    auc_ens    = roc_auc_score(yn['va'], ep_va)
+    auc_best   = roc_auc_score(yn['va'], best_va)
+    print(f"  集成 AUC-ROC={auc_ens:.4f}  vs  {best_s} AUC-ROC={auc_best:.4f}")
+    if not np.isnan(p_dl):
+        sig = "（差异有统计学意义，p<0.05）" if p_dl < 0.05 else "（差异无统计学意义）"
+        print(f"  DeLong z={z_dl:.3f}  p={p_dl:.4f}  {sig}")
+    else:
+        print("  ⚠️ DeLong检验无法计算（样本量可能不足）")
+    delong_df = pd.DataFrame([{
+        '比较':          f'集成 vs {best_s}',
+        '集成 AUC-ROC': round(auc_ens,  4),
+        f'{best_s} AUC-ROC': round(auc_best, 4),
+        'DeLong z':     round(z_dl,  3) if not np.isnan(z_dl) else 'NaN',
+        'p值':           round(p_dl,  4) if not np.isnan(p_dl) else 'NaN',
+    }])
+    delong_df.to_csv(out('delong_test_results.csv'), index=False, encoding='utf-8-sig')
+    print(f"  ✅ DeLong检验结果已保存: {out('delong_test_results.csv')}")
+except Exception as e_dl:
+    print(f"  ⚠️ DeLong检验失败: {str(e_dl)[:80]}")
+
 
 _p10 = sns.color_palette('tab10', 10)
 CC   = {n: _p10[i] for i, n in enumerate(clf_names)}
@@ -1276,7 +1496,61 @@ print(f"""
              shap_decision.png / shap_risk_stratification.png
              shap_individual_composition.png / shap_dependence_*.png
     汇总:    model_heatmap.png / comprehensive_performance.csv
+    补充材料: nested_cv_results.csv / smote_vs_easyensemble.csv
+             ensemble_sensitivity.csv / delong_test_results.csv
 """)
 print("=" * 120)
 print("✅ 分析完成！POGD预测模型 v5.1".center(120))
 print("=" * 120)
+
+# ============================================================
+# 【补充】可复现性配置文件
+# ============================================================
+_step("生成可复现性配置文件（requirements.txt + 示例数据格式）...")
+
+# Copy the project requirements.txt (already maintained at repo root) to the output folder
+# so everything needed to reproduce the run is in one place.
+req_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'requirements.txt')
+req_path = out('requirements.txt')
+try:
+    import shutil
+    if os.path.exists(req_src):
+        shutil.copy2(req_src, req_path)
+        print(f"  ✅ requirements.txt 已复制到输出目录: {req_path}")
+    else:
+        raise FileNotFoundError(req_src)
+except Exception:
+    # Fallback: write pinned versions that match the repo requirements.txt
+    req_content = """\
+# POGD Prediction Model v5.1 — Python Dependencies
+# Install via: pip install -r requirements.txt
+pandas==2.1.4
+numpy==1.26.2
+matplotlib==3.8.2
+seaborn==0.13.0
+scikit-learn==1.3.2
+xgboost==2.0.2
+shap==0.44.0
+joblib==1.3.2
+streamlit==1.29.0
+scipy==1.11.4
+imbalanced-learn>=0.10.1
+"""
+    with open(req_path, 'w', encoding='utf-8') as f:
+        f.write(req_content)
+    print(f"  ✅ requirements.txt 已生成（回退模式）: {req_path}")
+
+# Generate an example header-only CSV so users know the expected column format
+try:
+    example_cols = (
+        ([id_col]  if id_col  else []) +
+        ([ins_col] if ins_col else []) +
+        [TARGET_COL] +
+        feat_cols[:min(10, len(feat_cols))]
+    )
+    pd.DataFrame(columns=example_cols).to_csv(
+        out('example_data_format.csv'), index=False, encoding='utf-8-sig')
+    print(f"  ✅ 示例数据格式文件已生成（仅表头，前{min(10,len(feat_cols))}个特征）: "
+          f"{out('example_data_format.csv')}")
+except Exception as e_ex:
+    print(f"  ⚠️ 示例数据格式文件生成失败: {e_ex}")
