@@ -201,6 +201,43 @@ def bci(yt, yp, func, nb=BOOTSTRAP_N, ci=CI_LEVEL, seed=RANDOM_SEED):
     a = (1 - ci) / 2
     return float(np.quantile(sc, a)), float(np.quantile(sc, 1 - a))
 
+def delong_test(y_true, y_pred1, y_pred2):
+    """
+    DeLong test for comparing two correlated AUCs (DeLong et al., 1988).
+    Returns (z_statistic, p_value).
+    """
+    y_true = _np(y_true); y1 = _np(y_pred1); y2 = _np(y_pred2)
+    pos_idx = np.where(y_true == 1)[0]
+    neg_idx = np.where(y_true == 0)[0]
+    n1, n2 = len(pos_idx), len(neg_idx)
+    if n1 == 0 or n2 == 0:
+        return float('nan'), float('nan')
+
+    def _placement(scores):
+        V10 = np.array([
+            np.mean((scores[pos_idx[i]] > scores[neg_idx]) +
+                    0.5 * (scores[pos_idx[i]] == scores[neg_idx]))
+            for i in range(n1)])
+        V01 = np.array([
+            np.mean((scores[pos_idx] > scores[neg_idx[j]]) +
+                    0.5 * (scores[pos_idx] == scores[neg_idx[j]]))
+            for j in range(n2)])
+        return V10, V01
+
+    V10_1, V01_1 = _placement(y1)
+    V10_2, V01_2 = _placement(y2)
+    auc1, auc2 = np.mean(V10_1), np.mean(V10_2)
+    # Covariance of [auc1, auc2] via structural components
+    mat10 = np.cov(np.vstack([V10_1, V10_2])) / n1
+    mat01 = np.cov(np.vstack([V01_1, V01_2])) / n2
+    S = mat10 + mat01
+    var_diff = S[0, 0] + S[1, 1] - 2 * S[0, 1]
+    if var_diff <= 1e-12:
+        return float('nan'), float('nan')
+    z = (auc1 - auc2) / np.sqrt(var_diff)
+    p = float(2 * (1 - stats.norm.cdf(abs(z))))
+    return float(z), p
+
 def roc_ci(yt, yp, nb=BOOTSTRAP_N, ci=CI_LEVEL, seed=RANDOM_SEED):
     yt = _np(yt); yp = _np(yp)
     f0, t0, _ = roc_curve(yt, yp); mf = np.linspace(0, 1, 100)
@@ -727,6 +764,49 @@ if nested_rows:
     print(f"\n  嵌套CV汇总：\n{nested_cv_df.to_string(index=False)}")
     print(f"  ✅ 嵌套CV结果已保存: {out('nested_cv_results.csv')}")
 
+# --- SMOTE sensitivity analysis (supplement: compare to EasyEnsemble) ---
+_step("正在进行类不平衡方法敏感性分析（SMOTE vs EasyEnsemble）...")
+try:
+    from imblearn.over_sampling import SMOTE
+    smote_rows = []
+    smote_cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    for nm_s, cfg_s in clf_cfg.items():
+        try:
+            smote_ap_list = []
+            smote_roc_list = []
+            for tr_idx, va_idx in smote_cv.split(Xi_sel_full, yi_arr):
+                X_fold_tr, y_fold_tr = Xi_sel_full.iloc[tr_idx], yi_arr[tr_idx]
+                X_fold_va, y_fold_va = Xi_sel_full.iloc[va_idx], yi_arr[va_idx]
+                sm = SMOTE(random_state=RANDOM_SEED)
+                X_res, y_res = sm.fit_resample(X_fold_tr, y_fold_tr)
+                m_s = clone(cfg_s['model'])
+                if nm_s in bp and bp[nm_s]: m_s.set_params(**bp[nm_s])
+                m_s.fit(X_res, y_res)
+                yp_fold = m_s.predict_proba(X_fold_va)[:, 1]
+                if len(np.unique(y_fold_va)) > 1:
+                    smote_ap_list.append(average_precision_score(y_fold_va, yp_fold))
+                    smote_roc_list.append(roc_auc_score(y_fold_va, yp_fold))
+            if smote_ap_list:
+                smote_rows.append({
+                    '模型':                nm_s,
+                    'SMOTE CV AUC-PR 均值': round(np.mean(smote_ap_list),  4),
+                    'SMOTE CV AUC-PR 标准差':round(np.std(smote_ap_list),   4),
+                    'SMOTE CV AUC-ROC 均值':round(np.mean(smote_roc_list), 4),
+                    'SMOTE CV AUC-ROC 标准差':round(np.std(smote_roc_list), 4),
+                    'EasyEnsemble CV AUC-PR': round(cv_scores.get(nm_s, float('nan')), 4),
+                })
+        except Exception as e_s:
+            print(f"    {nm_s} SMOTE失败: {str(e_s)[:60]}  ⚠️")
+    if smote_rows:
+        smote_df = pd.DataFrame(smote_rows).sort_values('SMOTE CV AUC-PR 均值', ascending=False)
+        smote_df.to_csv(out('smote_vs_easyensemble.csv'), index=False, encoding='utf-8-sig')
+        print(f"\n  SMOTE vs EasyEnsemble 对比汇总：\n{smote_df.to_string(index=False)}")
+        print(f"  ✅ 对比结果已保存: {out('smote_vs_easyensemble.csv')}")
+except ImportError:
+    print("  ⚠️ imbalanced-learn 未安装，跳过SMOTE敏感性分析（pip install imbalanced-learn）")
+except Exception as e_smote:
+    print(f"  ⚠️ SMOTE敏感性分析失败: {str(e_smote)[:80]}")
+
 
 print("\n" + "=" * 120)
 print("【第5部分】各基分类器预测与评估")
@@ -808,6 +888,65 @@ if has_ext:
 DS_KEYS   = ['tr', 'va'] + (['ex'] if has_ext else [])
 DS_LABELS = ['训练集', '内部验证集'] + (['外部验证集'] if has_ext else [])
 nc = len(DS_KEYS)
+
+# ============================================================
+# 【第6B部分】集成策略敏感性分析 + DeLong检验（补充材料）
+# ============================================================
+print("\n" + "=" * 120)
+print("【第6B部分】集成策略敏感性分析（Top N × 加权/等权重）+ DeLong检验（补充材料）")
+print("=" * 120)
+
+_step("测试不同 Top-N 及加权/等权重集成策略（内部验证集）...")
+sens_rows = []
+for n_top in [2, 3, 5]:
+    n_top = min(n_top, len(clf_names))
+    top_n = [nm for nm, _ in sorted(cv_scores.items(),
+                                    key=lambda x: x[1] if not np.isnan(x[1]) else -1,
+                                    reverse=True)[:n_top]]
+    try:
+        prob_w = wsv(bag_mods, Xva_sel, top_n, cv_scores)
+        prob_e = wsv(bag_mods, Xva_sel, top_n, {nm: 1. for nm in top_n})
+        auc_w  = roc_auc_score(yn['va'], prob_w)
+        auc_e  = roc_auc_score(yn['va'], prob_e)
+        ap_w   = average_precision_score(yn['va'], prob_w)
+        ap_e   = average_precision_score(yn['va'], prob_e)
+        sens_rows.append({'Top-N': f'Top{n_top}', '策略': '加权投票',   'AUC-ROC': round(auc_w, 4), 'AUC-PR': round(ap_w, 4), '模型列表': str(top_n)})
+        sens_rows.append({'Top-N': f'Top{n_top}', '策略': '等权重投票', 'AUC-ROC': round(auc_e, 4), 'AUC-PR': round(ap_e, 4), '模型列表': str(top_n)})
+        print(f"  Top{n_top} 加权   AUC-ROC={auc_w:.4f}  AUC-PR={ap_w:.4f}")
+        print(f"  Top{n_top} 等权重 AUC-ROC={auc_e:.4f}  AUC-PR={ap_e:.4f}")
+    except Exception as e_sens:
+        print(f"  Top{n_top} 失败: {str(e_sens)[:60]}  ⚠️")
+
+if sens_rows:
+    sens_df = pd.DataFrame(sens_rows)
+    sens_df.to_csv(out('ensemble_sensitivity.csv'), index=False, encoding='utf-8-sig')
+    print(f"  ✅ 集成敏感性分析已保存: {out('ensemble_sensitivity.csv')}")
+
+_step("DeLong检验：集成模型 vs 最佳单模型（内部验证集）...")
+try:
+    ep_va      = ep['va']
+    best_va    = prob['va'][best_s]
+    z_dl, p_dl = delong_test(yn['va'], ep_va, best_va)
+    auc_ens    = roc_auc_score(yn['va'], ep_va)
+    auc_best   = roc_auc_score(yn['va'], best_va)
+    print(f"  集成 AUC-ROC={auc_ens:.4f}  vs  {best_s} AUC-ROC={auc_best:.4f}")
+    if not np.isnan(p_dl):
+        sig = "（差异有统计学意义，p<0.05）" if p_dl < 0.05 else "（差异无统计学意义）"
+        print(f"  DeLong z={z_dl:.3f}  p={p_dl:.4f}  {sig}")
+    else:
+        print("  ⚠️ DeLong检验无法计算（样本量可能不足）")
+    delong_df = pd.DataFrame([{
+        '比较':          f'集成 vs {best_s}',
+        '集成 AUC-ROC': round(auc_ens,  4),
+        f'{best_s} AUC-ROC': round(auc_best, 4),
+        'DeLong z':     round(z_dl,  3) if not np.isnan(z_dl) else 'NaN',
+        'p值':           round(p_dl,  4) if not np.isnan(p_dl) else 'NaN',
+    }])
+    delong_df.to_csv(out('delong_test_results.csv'), index=False, encoding='utf-8-sig')
+    print(f"  ✅ DeLong检验结果已保存: {out('delong_test_results.csv')}")
+except Exception as e_dl:
+    print(f"  ⚠️ DeLong检验失败: {str(e_dl)[:80]}")
+
 
 _p10 = sns.color_palette('tab10', 10)
 CC   = {n: _p10[i] for i, n in enumerate(clf_names)}
@@ -1357,7 +1496,61 @@ print(f"""
              shap_decision.png / shap_risk_stratification.png
              shap_individual_composition.png / shap_dependence_*.png
     汇总:    model_heatmap.png / comprehensive_performance.csv
+    补充材料: nested_cv_results.csv / smote_vs_easyensemble.csv
+             ensemble_sensitivity.csv / delong_test_results.csv
 """)
 print("=" * 120)
 print("✅ 分析完成！POGD预测模型 v5.1".center(120))
 print("=" * 120)
+
+# ============================================================
+# 【补充】可复现性配置文件
+# ============================================================
+_step("生成可复现性配置文件（requirements.txt + 示例数据格式）...")
+
+# Copy the project requirements.txt (already maintained at repo root) to the output folder
+# so everything needed to reproduce the run is in one place.
+req_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'requirements.txt')
+req_path = out('requirements.txt')
+try:
+    import shutil
+    if os.path.exists(req_src):
+        shutil.copy2(req_src, req_path)
+        print(f"  ✅ requirements.txt 已复制到输出目录: {req_path}")
+    else:
+        raise FileNotFoundError(req_src)
+except Exception:
+    # Fallback: write pinned versions that match the repo requirements.txt
+    req_content = """\
+# POGD Prediction Model v5.1 — Python Dependencies
+# Install via: pip install -r requirements.txt
+pandas==2.1.4
+numpy==1.26.2
+matplotlib==3.8.2
+seaborn==0.13.0
+scikit-learn==1.3.2
+xgboost==2.0.2
+shap==0.44.0
+joblib==1.3.2
+streamlit==1.29.0
+scipy==1.11.4
+imbalanced-learn>=0.10.1
+"""
+    with open(req_path, 'w', encoding='utf-8') as f:
+        f.write(req_content)
+    print(f"  ✅ requirements.txt 已生成（回退模式）: {req_path}")
+
+# Generate an example header-only CSV so users know the expected column format
+try:
+    example_cols = (
+        ([id_col]  if id_col  else []) +
+        ([ins_col] if ins_col else []) +
+        [TARGET_COL] +
+        feat_cols[:min(10, len(feat_cols))]
+    )
+    pd.DataFrame(columns=example_cols).to_csv(
+        out('example_data_format.csv'), index=False, encoding='utf-8-sig')
+    print(f"  ✅ 示例数据格式文件已生成（仅表头，前{min(10,len(feat_cols))}个特征）: "
+          f"{out('example_data_format.csv')}")
+except Exception as e_ex:
+    print(f"  ⚠️ 示例数据格式文件生成失败: {e_ex}")
