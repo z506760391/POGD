@@ -97,14 +97,14 @@ SHAP_SAMPLE        = 150
 SHAP_BG            = 50
 BOOTSTRAP_N        = 1000
 CI_LEVEL           = 0.95
-DATA_PATH          = 'D:/pycharm/pythonProject1/output/20260411.csv'
+DATA_PATH          = 'data.csv'   # Use a relative path; place your CSV file in the same directory as this script
 OUTPUT_DIR         = 'output'
 TARGET_COL         = 'POGD'
 INS_CANDIDATES     = ['ins', 'INS', 'source', '来源']
 ID_CANDIDATES      = ['ID', 'id', '样本ID', '样本id']
 MIN_FEATURES       = 5
 MAX_FEAT_RATIO     = 5
-PVAL_THRESHOLD     = 0.3
+PVAL_THRESHOLD     = 0.3   # Single-variable screening threshold (P < 0.3); ensure this matches your manuscript's reported value
 KS_DRIFT_THRESHOLD = 0.35
 
 np.random.seed(RANDOM_SEED)
@@ -447,6 +447,9 @@ for c in cat_c:
 print(f"  ✅ 编码分类变量: {cat_c if cat_c else '无'}")
 
 _step("正在用训练集统计量填充缺失值（防止验证集泄露）...")
+# Missing values are imputed with per-feature median (numeric) or mode (categorical)
+# computed exclusively on the training set.  If KNN imputation is desired instead,
+# replace the block below with sklearn.impute.KNNImputer fitted on Xtr only.
 fv = {}
 for c in feat_cols:
     fv[c] = Xtr[c].median() if Xtr[c].dtype in ['float64', 'int64'] \
@@ -479,23 +482,27 @@ print("\n" + "=" * 120)
 print("【第1部分】单变量特征筛选（仅用训练集，符合TRIPOD要求）")
 print("=" * 120)
 
-drift_remove_feats = []
+# KS drift detection is run for REPORTING and visualization only.
+# Its results must NOT be used to filter features for model training, because
+# the external validation set would then influence the training pipeline,
+# constituting information leakage that invalidates generalisation estimates.
+drift_info_feats = []   # informational only — not used to remove features
 if has_ext:
-    _step("P5修复：正在进行KS检验特征分布漂移分析...")
-    _, drift_remove_feats = distribution_shift_report(Xtr, Xe, feat_cols)
-    if drift_remove_feats:
-        print(f"  ⚠️  将剔除高漂移特征（KS>{KS_DRIFT_THRESHOLD}）: {drift_remove_feats}")
+    _step("P5修复：正在进行KS检验特征分布漂移分析（仅用于报告，不参与特征筛选，避免外部集信息泄露）...")
+    _, drift_info_feats = distribution_shift_report(Xtr, Xe, feat_cols)
+    if drift_info_feats:
+        print(f"  ℹ️  检测到高漂移特征（KS>{KS_DRIFT_THRESHOLD}，仅供参考）: {drift_info_feats}")
+        print(f"  ℹ️  高漂移特征将保留在训练流程中；仅在方法学部分披露，不剔除。")
     else:
         print("  ✅ 未发现高漂移特征")
 
-max_ft = max(MIN_FEATURES, min(recommended_max, len(feat_cols) - len(drift_remove_feats)))
+# Feature count cap is based solely on EPV from the training set (no external data).
+max_ft = max(MIN_FEATURES, min(recommended_max, len(feat_cols)))
 print(f"\n  阳性样本数={n_pos}，最多保留{max_ft}个特征（最少{MIN_FEATURES}个）")
 
 _step("正在进行单变量统计检验（Mann-Whitney U / 卡方检验）...")
 uni = []
 for c in feat_cols:
-    if c in drift_remove_feats:
-        continue
     try:
         if c in cat_c or Xtr[c].nunique() <= 5:
             ct = pd.crosstab(Xtr[c], ytr)
@@ -621,6 +628,14 @@ for idx_m, (nm, cfg) in enumerate(clf_cfg.items()):
         print(f"Failed: {str(e)[:50]}  ⚠️")
 
 _step(f"[4.2] Starting EasyEnsemble training ({EASY_N_BAGS} subsets × {len(clf_names)} classifiers = {EASY_N_BAGS*len(clf_names)} sub-models)...")
+# NOTE — double-calibration pipeline:
+#   Stage 1 (here): each base model in every EasyEnsemble bag is wrapped with
+#            CalibratedClassifierCV(method='sigmoid', cv=3), fitted on the
+#            balanced bag data only — no leakage from validation/external sets.
+#   Stage 2 (Part 6): the soft-voting ensemble raw probabilities are calibrated
+#            once more with Platt scaling, fitted exclusively on the full
+#            training set — still no leakage.
+# Both stages are independent of the validation and external sets.
 print("      P7 Fix: Use CalibratedClassifierCV(sigmoid, cv=3) for each subset to mitigate overfitting")
 bag_mods = []
 for bi, (Xb, yb) in enumerate(bags):
